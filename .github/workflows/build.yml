@@ -1,0 +1,53 @@
+name: Build ESP32 Firmware
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6.0.2
+
+      - name: Build
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.2.6
+          target: esp32s3
+          path: .
+          command: >-
+            rm -f sdkconfig &&
+            export SDKCONFIG_DEFAULTS=sdkconfig.defaults &&
+            idf.py set-target esp32s3 &&
+            idf.py reconfigure &&
+            idf.py build
+
+      - name: Merge binaries into single flash image
+        run: |
+          set -e
+
+          if [ ! -f build/flash_args ]; then
+            echo "flash_args not found; cannot create merged image"
+            exit 1
+          fi
+
+          pip install --no-cache-dir esptool
+
+          mkdir -p release
+
+          # Run merge inside build dir so relative paths in flash_args resolve
+          (
+            cd build
+            python -m esptool --chip esp32s3 merge-bin -o ../release/ramses_esp_esp32_s3.bin $(tr '\n' ' ' < flash_args)
+          )
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: esp32s3-firmware-${{ github.sha }}
+          archive: false
+          if-no-files-found: error
+          path: release/ramses_esp_esp32_s3.bin

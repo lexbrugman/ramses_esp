@@ -7,4 +7,4 @@ dependencies:
 # in the framework directory
 # git revert 04ac8e43dbaf37e42452fef034606ae3f04e644b  
   idf: 
-    version: "==5.2.1"
+    version: "==5.2.6"
