@@ -8,6 +8,9 @@
  *
  */
 #include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <stdbool.h>
 
 static const char *TAG = "MQTT";
 #include "esp_log.h"
@@ -66,6 +69,8 @@ struct mqtt_data {
   enum mqtt_state state;
   char root[20];
   char topic[32];
+  char *broker_uri;
+  char *broker_host;
 
   esp_mqtt_client_config_t cfg;
   esp_mqtt_client_handle_t client;
@@ -106,11 +111,114 @@ static void log_error_if_nonzero( const char *message, int error_code ) {
   }
 }
 
+static char const *mqtt_broker_uri( struct mqtt_data *ctxt, char const *broker ) {
+  static char const protocol[] = "mqtt://";
+
+  if( !broker || broker[0] == '\0' ) {
+    if( ctxt->broker_uri ) {
+      free( ctxt->broker_uri );
+      ctxt->broker_uri = NULL;
+    }
+    return broker;
+  }
+
+  if( strstr( broker, "://" ) ) {
+    if( ctxt->broker_uri ) {
+      free( ctxt->broker_uri );
+      ctxt->broker_uri = NULL;
+    }
+    return broker;
+  }
+
+  if( ctxt->broker_uri && strcmp( ctxt->broker_uri + sizeof(protocol) - 1, broker ) == 0 ) {
+    return ctxt->broker_uri;
+  }
+
+  size_t len = sizeof(protocol) - 1 + strlen( broker ) + 1;
+  char *uri = malloc( len );
+  if( !uri ) {
+    ESP_LOGE( TAG, "Unable to allocate MQTT broker URI" );
+    return NULL;
+  }
+
+  snprintf( uri, len, "%s%s", protocol, broker );
+
+  if( ctxt->broker_uri ) free( ctxt->broker_uri );
+  ctxt->broker_uri = uri;
+
+  ESP_LOGI( TAG, "MQTT broker '%s' normalized to '%s'", broker, ctxt->broker_uri );
+
+  return ctxt->broker_uri;
+}
+
+static bool mqtt_use_hostname_cfg( struct mqtt_data *ctxt, char const *uri ) {
+  char const *host_start = NULL;
+  char const *host_end = NULL;
+  char const *port_start = NULL;
+  int default_port = 1883;
+  bool use_ssl = false;
+
+  if( !uri ) return false;
+
+  if( strncmp( uri, "mqtt://", 7 ) == 0 ) {
+    host_start = uri + 7;
+  } else if( strncmp( uri, "mqtts://", 8 ) == 0 ) {
+    host_start = uri + 8;
+    default_port = 8883;
+    use_ssl = true;
+  } else {
+    return false;
+  }
+
+  if( host_start[0] == '[' ) { // IPv6 literal
+    host_start++;
+    host_end = strchr( host_start, ']' );
+    if( !host_end ) return false;
+    if( host_end[1] == ':' ) port_start = host_end + 2;
+  } else {
+    host_end = host_start;
+    while( host_end[0] && host_end[0] != ':' && host_end[0] != '/' ) host_end++;
+    if( host_end[0] == ':' ) port_start = host_end + 1;
+  }
+
+  if( host_end <= host_start ) return false;
+
+  size_t host_len = host_end - host_start;
+  char *host = malloc( host_len + 1 );
+  if( !host ) return false;
+  memcpy( host, host_start, host_len );
+  host[host_len] = '\0';
+
+  int port = default_port;
+  if( port_start && port_start[0] != '\0' ) {
+    char *endptr = NULL;
+    long parsed_port = strtol( port_start, &endptr, 10 );
+    if( endptr != port_start && endptr && ( endptr[0] == '\0' || endptr[0] == '/' ) && parsed_port > 0 && parsed_port <= 65535 ) {
+      port = (int)parsed_port;
+    } else {
+      free( host );
+      return false;
+    }
+  }
+
+  if( ctxt->broker_host ) free( ctxt->broker_host );
+  ctxt->broker_host = host;
+
+  ctxt->cfg.broker.address.uri = NULL;
+  ctxt->cfg.broker.address.hostname = ctxt->broker_host;
+  ctxt->cfg.broker.address.port = port;
+  ctxt->cfg.broker.address.transport = use_ssl ? MQTT_TRANSPORT_OVER_SSL : MQTT_TRANSPORT_OVER_TCP;
+
+  ESP_LOGI( TAG, "MQTT broker hostname='%s' port=%d transport=%s", ctxt->broker_host, port, use_ssl ? "ssl" : "tcp" );
+  return true;
+}
+
 static bool mqtt_broker_configured( struct mqtt_data *ctxt ) {
   bool res;
 
   // Most recent config
-  char const * uri = NET_get_mqtt_broker();
+  char const * broker = NET_get_mqtt_broker();
+  char const * uri = mqtt_broker_uri( ctxt, broker );
   char const * user = NET_get_mqtt_user();
   char const * password = NET_get_mqtt_password();
 
@@ -128,7 +236,15 @@ static bool mqtt_broker_configured( struct mqtt_data *ctxt ) {
   }
 
   if( res ) {
+    if( ctxt->broker_host ) {
+      free( ctxt->broker_host );
+      ctxt->broker_host = NULL;
+    }
+
     ctxt->cfg.broker.address.uri = uri;
+    ctxt->cfg.broker.address.hostname = NULL;
+    ctxt->cfg.broker.address.port = 0;
+    mqtt_use_hostname_cfg( ctxt, uri );
     ctxt->cfg.credentials.username = user;
     ctxt->cfg.credentials.authentication.password = password;
   }
