@@ -1,0 +1,43 @@
+name: Build ESP32 Firmware
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      ESP_TARGET_PLATFORM: esp32s3
+      ESP_IDF_VERSION: 5.5.4
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6.0.2
+
+      - name: Build
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v${{ env.ESP_IDF_VERSION }}
+          target: ${{ env.ESP_TARGET_PLATFORM }}
+          path: .
+
+      - name: Merge binaries into single flash image
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v${{ env.ESP_IDF_VERSION }}
+          target: ${{ env.ESP_TARGET_PLATFORM }}
+          path: .
+          command: |
+            mkdir -p release
+            cd build
+            esptool.py --chip ${{ env.ESP_TARGET_PLATFORM }} merge_bin -o ../release/ramses_esp_${{ env.ESP_TARGET_PLATFORM }}.bin @flash_args
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ESP_TARGET_PLATFORM }}-firmware-${{ github.sha }}
+          archive: false
+          if-no-files-found: error
+          path: release/
