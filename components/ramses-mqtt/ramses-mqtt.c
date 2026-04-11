@@ -200,6 +200,7 @@ static void mqtt_publish_rx( struct mqtt_data *ctxt, char const *ts, char const 
   sprintf( topic, "%s/rx", ctxt->topic );
   esp_mqtt_client_publish( ctxt->client,topic, rx, 0, 1, 0 );
 
+  cJSON_free( rx );
   cJSON_Delete( json );
 }
 
@@ -326,7 +327,6 @@ static void mqtt_event_handler( void *handler_args, esp_event_base_t base, int32
   case MQTT_EVENT_DISCONNECTED:
     ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
     printf("# MQTT: Disonnected\n");
-    esp_restart();
     break;
 
   case MQTT_EVENT_SUBSCRIBED:
