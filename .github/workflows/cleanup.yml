@@ -1,0 +1,75 @@
+name: Cleanup
+
+# Firmware CI (firmware.yml) creates per-branch releases ("<branch>-latest"
+# releases and "<branch>-<timestamp>-<sha>" archives) that nothing
+# removes when the branch goes away. The "delete" trigger prunes a branch's releases the
+# moment it is deleted; the "release" trigger removes the git tag left
+# behind when a release is deleted by hand (GitHub keeps the tag when a
+# release is deleted from the UI/API). Each event runs exactly one job, and
+# the release deletions prune-releases performs here run under GITHUB_TOKEN
+# — which never triggers other workflow runs — so the two jobs cannot end
+# up running concurrently. Both triggers only fire from the workflow file
+# on the default branch.
+on:
+  delete:
+  release:
+    types: [deleted]
+
+permissions:
+  contents: write
+
+jobs:
+  prune-releases:
+    name: Prune releases of deleted branch
+    if: github.event_name == 'delete' && github.event.ref_type == 'branch'
+    runs-on: ubuntu-latest
+    # Same group as firmware.yml uses for this branch, so pruning waits for an
+    # in-flight build instead of racing its publish job.
+    concurrency:
+      group: firmware-refs/heads/${{ github.event.ref }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Delete the branch's releases and their tags
+        env:
+          DELETED_BRANCH: ${{ github.event.ref }}
+        run: |
+          gh release list --limit 1000 --json tagName -q '.[].tagName' --repo "$GITHUB_REPOSITORY" |
+          while read -r tag; do
+            # Only touch CI-created tags ("<branch>-latest" releases and
+            # "<branch>-<timestamp>-<sha>" archives, see firmware.yml); anything
+            # hand-made (e.g. "v1.0") is left alone. Branch names are sanitized
+            # the same way firmware.yml builds release tags (slashes become
+            # dashes).
+            [[ "$tag" =~ ^(.+)-latest$ ]] ||
+              [[ "$tag" =~ ^(.+)-[0-9]{8}-[0-9]{6}-[0-9a-f]{7,40}$ ]] ||
+              continue
+            [ "${BASH_REMATCH[1]}" = "${DELETED_BRANCH//\//-}" ] || continue
+            echo "Deleting release + tag: $tag"
+            gh release delete "$tag" --yes --cleanup-tag --repo "$GITHUB_REPOSITORY"
+          done
+
+  prune-tags:
+    name: Prune tag of deleted release
+    if: github.event_name == 'release' && github.event.action == 'deleted'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Delete the deleted release's tag
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          # Only touch CI-created tags ("<branch>-latest" releases and
+          # "<branch>-<timestamp>-<sha>" archives, see firmware.yml); anything
+          # hand-made (e.g. "v1.0") is left alone.
+          [[ "$TAG" =~ ^(.+)-([0-9a-f]{7,40}|latest)$ ]] || exit 0
+          # A release may exist again for this tag by the time we run (e.g.
+          # the rolling "<branch>-latest" release is deleted and immediately
+          # recreated on every push) — leave such tags alone.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release exists again for $TAG; leaving tag in place"
+            exit 0
+          fi
+          echo "Deleting orphaned tag: $TAG"
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" || true

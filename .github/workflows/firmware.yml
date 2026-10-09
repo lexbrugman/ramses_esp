@@ -1,0 +1,135 @@
+name: Firmware
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A superseded run must never finish last and replace a newer rolling release.
+# Manual runs do not publish, so they get their own group and can neither
+# cancel nor displace a push run. cleanup.yml joins the push group so pruning
+# never races a build for the branch.
+concurrency:
+  group: firmware-${{ github.event_name == 'workflow_dispatch' && 'manual-' || '' }}${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build firmware (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [esp32s3]
+    env:
+      ESP_IDF_VERSION: 5.5.4
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Determine version
+        id: ver
+        run: |
+          echo "version=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v${{ env.ESP_IDF_VERSION }}
+          target: ${{ matrix.target }}
+          path: .
+
+      - name: Merge binaries into single flash image
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v${{ env.ESP_IDF_VERSION }}
+          target: ${{ matrix.target }}
+          path: .
+          command: |
+            cd build
+            esptool.py --chip ${{ matrix.target }} merge_bin -o ramses_esp_${{ matrix.target }}.bin @flash_args
+
+      # The build steps run in a container as root, so dist/ must be created
+      # here on the runner for it to be writable.
+      - name: Stage release assets
+        run: |
+          mkdir -p dist
+          cp build/ramses_esp_${{ matrix.target }}.bin dist/
+          echo -n "${{ steps.ver.outputs.version }}" > dist/version.txt
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: firmware-${{ matrix.target }}-${{ steps.ver.outputs.version }}
+          path: dist/
+
+  publish:
+    name: Publish rolling release
+    if: github.event_name == 'push' && github.ref_type == 'branch'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download builds
+        uses: actions/download-artifact@v8
+        with:
+          pattern: firmware-*-${{ needs.build.outputs.version }}
+          path: dist
+          merge-multiple: true
+
+      # Each branch's newest firmware has a stable download URL, e.g.
+      #   .../releases/download/main-latest/ramses_esp_esp32s3.bin
+      # Only the default branch's release gets GitHub's "Latest" badge, so
+      # feature-branch pushes never steal it.
+      - name: Publish "<branch>-latest" release
+        run: |
+          tag="${GITHUB_REF_NAME//\//-}-latest"
+          if [ "$GITHUB_REF_NAME" = "${{ github.event.repository.default_branch }}" ]; then
+            latest=true
+          else
+            latest=false
+          fi
+          gh release delete "$tag" --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" || true
+          gh release create "$tag" dist/*.bin dist/version.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$tag" \
+            --notes "Rolling release for branch \`$GITHUB_REF_NAME\` — CI overwrites it on every push. Built from ${GITHUB_SHA:0:7} (version ${{ needs.build.outputs.version }})." \
+            --latest=$latest
+
+      # Alongside the rolling release above (which CI overwrites every push),
+      # keep one untouched release per build so past firmware versions stay
+      # browsable/downloadable. Tagged by branch+timestamp+commit so it never
+      # collides with — or gets cleaned up by — the rolling tag: the commit
+      # makes the tag unique, and the UTC commit-date stamp makes tags sort
+      # chronologically (GitHub's releases page orders by name, which is
+      # random for bare short SHAs; "latest" sorts above any digit, so the
+      # rolling release stays on top of its branch's archives). cleanup.yml
+      # parses this tag format when pruning a deleted branch's releases —
+      # keep the two in sync.
+      # Only the default branch is archived: it's the audit trail of firmware
+      # devices may have run, while feature-branch builds are throwaway.
+      # --latest=false keeps GitHub's "Latest" badge on the default branch's
+      # rolling release rather than letting it jump to whichever release was
+      # created last.
+      - name: Archive this build's release
+        if: github.ref_name == github.event.repository.default_branch
+        run: |
+          stamp="$(TZ=UTC git show -s --format=%cd --date=format-local:%Y%m%d-%H%M%S "$GITHUB_SHA")"
+          tag="${GITHUB_REF_NAME//\//-}-$stamp-${{ needs.build.outputs.version }}"
+          # A re-run for the same commit replaces its own archive.
+          gh release delete "$tag" --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" || true
+          gh release create "$tag" dist/*.bin dist/version.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$tag (build history)" \
+            --notes "Archived build for branch \`$GITHUB_REF_NAME\` — commit ${GITHUB_SHA:0:7} (version ${{ needs.build.outputs.version }})." \
+            --latest=false
