@@ -63,8 +63,19 @@ integration (discovery prefix `homeassistant`, configurable in menuconfig) as a
 | Entity | Type | Notes |
 | --- | --- | --- |
 | Firmware | update | titled with the OTA channel and linked to its release page; Install downloads and flashes the latest, with progress |
+| Last restart | sensor | diagnostic, when the gateway last restarted |
 | Check for updates | button | re-read the OTA channel's version now instead of waiting for the next check |
 | Restart | button | reboot the ESP |
 
 These sit alongside the `RAMSES/GATEWAY/<device>/...` topics host applications
-use; the OTA state is published under `RAMSES/GATEWAY/<device>/ota/`.
+use; the OTA state is published under `RAMSES/GATEWAY/<device>/ota/` and the
+uptime for **Last restart** on `RAMSES/GATEWAY/<device>/uptime`.
+
+The gateway has no reliable clock, so for **Last restart** it publishes its
+uptime and Home Assistant converts that into a timestamp. It sends it only when
+it connects and when Home Assistant restarts, so the entity's state changes
+only on a restart.
+
+Entities removed from the firmware disappear from Home Assistant on their own:
+after connecting, the gateway deletes any retained discovery config under its
+node ID (`ramses_esp_<device>`) that it didn't publish itself.

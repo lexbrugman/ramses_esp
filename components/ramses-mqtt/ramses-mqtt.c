@@ -16,6 +16,7 @@ static const char *TAG = "MQTT";
 #include "freertos/task.h"
 #include "esp_event.h"
 #include "esp_app_desc.h"
+#include "esp_timer.h"
 
 #include "mqtt_client.h"
 #include "cJSON.h"
@@ -72,6 +73,9 @@ struct mqtt_data {
 
   uint8_t info;
   uint32_t ota_seq;	// Last OTA status published, 0 forces a publish
+
+  volatile bool ha_online;	// Home Assistant (re)started, set from the event handler
+  int64_t uptime_due;	// esp_timer time to publish the uptime, 0 when none due
 };
 
 static struct mqtt_data *mqtt_ctxt( void ) {
@@ -184,13 +188,45 @@ static void mqtt_publish_info( struct mqtt_data *ctxt ) {
   }
 }
 
+// Give Home Assistant time to set up the entities after discovery, or after
+// it (re)starts, before publishing state it has to receive
+#define HA_SETTLE_US ( 5*1000000LL )
+
 /*******************************************************************************
  * Home Assistant discovery
  *
  * Registers the gateway as a Home Assistant device with a firmware update
- * entity, plus buttons to check for updates and restart. Their commands are
- * plain console commands sent to the cmd topic.
+ * entity, a last restart sensor, plus buttons to check for updates and
+ * restart. The buttons' commands are plain console commands sent to the cmd
+ * topic.
+ *
+ * Retained discovery configs under this device's node ID for entities not in
+ * HA_ENTITY_LIST are deleted so Home Assistant removes those entities.
  */
+
+// Every entity mqtt_publish_discovery() publishes: id, component, object
+#define HA_ENTITY_LIST \
+  HA_ENTITY( HA_FIRMWARE,     "update", "firmware" ) \
+  HA_ENTITY( HA_LAST_RESTART, "sensor", "last_restart" ) \
+  HA_ENTITY( HA_CHECK_UPDATE, "button", "check_update" ) \
+  HA_ENTITY( HA_RESTART,      "button", "restart" ) \
+
+#define HA_ENTITY( _e, _c, _o ) _e,
+enum ha_entity_id {
+  HA_ENTITY_LIST
+  HA_ENTITY_MAX
+};
+#undef HA_ENTITY
+
+#define HA_ENTITY( _e, _c, _o ) [_e] = { _c, _o },
+static struct ha_entity {
+  char const *component;
+  char const *object;
+} const ha_entities[HA_ENTITY_MAX] = {
+  HA_ENTITY_LIST
+};
+#undef HA_ENTITY
+
 static void mqtt_ha_id( char *id, size_t size ) {
   // Discovery IDs only allow [a-zA-Z0-9_-]; the device ID looks like 18:123456
   snprintf( id, size, "ramses_esp_%s", device() );
@@ -198,7 +234,9 @@ static void mqtt_ha_id( char *id, size_t size ) {
     if( *c==':' ) *c = '_';
 }
 
-static void mqtt_ha_publish( struct mqtt_data *ctxt, char const *component, char const *object, cJSON *json ) {
+static void mqtt_ha_publish( struct mqtt_data *ctxt, enum ha_entity_id entity, cJSON *json ) {
+  char const *component = ha_entities[entity].component;
+  char const *object = ha_entities[entity].object;
   const esp_app_desc_t *app = esp_app_get_description();
   char id[32], unique_id[64], name[48], model[48], topic[128];
 
@@ -226,7 +264,7 @@ static void mqtt_ha_publish( struct mqtt_data *ctxt, char const *component, char
   cJSON_Delete( json );
 }
 
-static void mqtt_ha_button( struct mqtt_data *ctxt, char const *object, char const *name,
+static void mqtt_ha_button( struct mqtt_data *ctxt, enum ha_entity_id entity, char const *name,
                             char const *device_class, char const *icon, char const *press ) {
   char cmd_topic[64];
   snprintf( cmd_topic, sizeof(cmd_topic), "%s/cmd/cmd", ctxt->topic );
@@ -238,7 +276,7 @@ static void mqtt_ha_button( struct mqtt_data *ctxt, char const *object, char con
   cJSON_AddStringToObject( json, "entity_category", "config" );
   cJSON_AddStringToObject( json, "command_topic", cmd_topic );
   cJSON_AddStringToObject( json, "payload_press", press );
-  mqtt_ha_publish( ctxt, "button", object, json );
+  mqtt_ha_publish( ctxt, entity, json );
 }
 
 static void mqtt_publish_discovery( struct mqtt_data *ctxt ) {
@@ -259,12 +297,81 @@ static void mqtt_publish_discovery( struct mqtt_data *ctxt ) {
   cJSON_AddStringToObject( json, "payload_install", "ota start" );
   cJSON_AddStringToObject( json, "title", ota_channel() );
   cJSON_AddStringToObject( json, "release_url", ota_release_url() );
-  mqtt_ha_publish( ctxt, "update", "firmware", json );
+  mqtt_ha_publish( ctxt, HA_FIRMWARE, json );
+
+  // The gateway has no reliable clock, so it publishes its uptime and Home
+  // Assistant turns that into the moment it restarted. Only sent on connect
+  // and when Home Assistant restarts, see mqtt_publish_uptime
+  char uptime_topic[64];
+  snprintf( uptime_topic, sizeof(uptime_topic), "%s/uptime", ctxt->topic );
+  json = cJSON_CreateObject();
+  cJSON_AddStringToObject( json, "name", "Last restart" );
+  cJSON_AddStringToObject( json, "device_class", "timestamp" );
+  cJSON_AddStringToObject( json, "entity_category", "diagnostic" );
+  cJSON_AddStringToObject( json, "state_topic", uptime_topic );
+  cJSON_AddStringToObject( json, "value_template",
+    "{{ (now() - timedelta(seconds=value|int)).replace(microsecond=0).isoformat() }}" );
+  mqtt_ha_publish( ctxt, HA_LAST_RESTART, json );
 
   // Re-reads the OTA channel's version now instead of waiting for the next
   // periodic check; never installs
-  mqtt_ha_button( ctxt, "check_update", "Check for updates", NULL, "mdi:cloud-search", "ota check" );
-  mqtt_ha_button( ctxt, "restart", "Restart", "restart", NULL, "reset" );
+  mqtt_ha_button( ctxt, HA_CHECK_UPDATE, "Check for updates", NULL, "mdi:cloud-search", "ota check" );
+  mqtt_ha_button( ctxt, HA_RESTART, "Restart", "restart", NULL, "reset" );
+}
+
+static void mqtt_subscribe_ha( struct mqtt_data *ctxt ) {
+  char id[32], topic[128];
+  mqtt_ha_id( id, sizeof(id) );
+
+  // Home Assistant's birth message
+  snprintf( topic, sizeof(topic), "%s/status", CONFIG_MQTT_HA_DISCOVERY_PREFIX );
+  esp_mqtt_client_subscribe( ctxt->client, topic, 0 );
+
+  // Replays every retained discovery config under this device's node ID
+  snprintf( topic, sizeof(topic), "%s/+/%s/+/config", CONFIG_MQTT_HA_DISCOVERY_PREFIX, id );
+  esp_mqtt_client_subscribe( ctxt->client, topic, 0 );
+}
+
+static bool mqtt_ha_known( char const *component, char const *object ) {
+  for( int i=0; i<HA_ENTITY_MAX; i++ ) {
+    if( !strcmp( ha_entities[i].component, component ) && !strcmp( ha_entities[i].object, object ) )
+      return true;
+  }
+  return false;
+}
+
+// subtopic is the topic below the discovery prefix
+static void mqtt_process_ha( struct mqtt_data *ctxt, char *subtopic, esp_mqtt_event_handle_t event ) {
+  if( !strcmp( subtopic, "status" ) ) {
+    if( event->data_len==6 && !strncmp( event->data, "online", 6 ) )
+      ctxt->ha_online = true;
+    return;
+  }
+
+  // An empty config is a deletion, possibly our own
+  if( event->total_data_len==0 )
+    return;
+
+  // <component>/<node id>/<object>/config
+  char *component = subtopic;
+  char *node = strchr( component, '/' );
+  char *object = node ? strchr( node+1, '/' ) : NULL;
+  char *config = object ? strchr( object+1, '/' ) : NULL;
+  if( !config || strcmp( config, "/config" ) )
+    return;
+  *node++ = '\0';
+  *object++ = '\0';
+  *config = '\0';
+
+  char id[32];
+  mqtt_ha_id( id, sizeof(id) );
+  if( strcmp( node, id ) || mqtt_ha_known( component, object ) )
+    return;
+
+  char topic[128];
+  snprintf( topic, sizeof(topic), "%s/%s/%s/%s/config", CONFIG_MQTT_HA_DISCOVERY_PREFIX, component, node, object );
+  esp_mqtt_client_publish( ctxt->client, topic, NULL, 0, 1, 1 );
+  printf("# MQTT: removed retired Home Assistant entity %s/%s\n", component, object );
 }
 
 static void mqtt_publish_ota( struct mqtt_data *ctxt ) {
@@ -297,6 +404,25 @@ static void mqtt_publish_ota( struct mqtt_data *ctxt ) {
     sprintf( topic, "%s/ota/latest", ctxt->topic );
     esp_mqtt_client_publish( ctxt->client, topic, status.latest, 0, 1, 1 );
   }
+}
+
+// Not retained: Home Assistant converts the uptime to a timestamp using the
+// time it receives it, so a replayed value would give the wrong restart time.
+static void mqtt_publish_uptime( struct mqtt_data *ctxt ) {
+  int64_t now = esp_timer_get_time();
+
+  if( ctxt->ha_online ) {
+    ctxt->ha_online = false;
+    ctxt->uptime_due = now + HA_SETTLE_US;
+  }
+  if( !ctxt->uptime_due || now < ctxt->uptime_due )
+    return;
+  ctxt->uptime_due = 0;
+
+  char topic[64], uptime[24];
+  sprintf( topic, "%s/uptime", ctxt->topic );
+  sprintf( uptime, "%lld", now/1000000 );
+  esp_mqtt_client_publish( ctxt->client, topic, uptime, 0, 1, 0 );
 }
 
 /*******************************************************************************
@@ -411,6 +537,21 @@ static void mqtt_process_data( struct mqtt_data *ctxt, esp_mqtt_event_handle_t e
   };
   struct topic const *topic = topic_list;
 
+  // Only the first fragment of a large message carries the topic; none of
+  // the handlers need more than that
+  if( event->current_data_offset!=0 )
+    return;
+
+  size_t ha_len = strlen( CONFIG_MQTT_HA_DISCOVERY_PREFIX );
+  if( event->topic_len>ha_len && !strncmp( event->topic, CONFIG_MQTT_HA_DISCOVERY_PREFIX "/", ha_len+1 ) ) {
+    char ha_topic[128];
+    if( event->topic_len < sizeof(ha_topic) ) {
+      sprintf( ha_topic, "%.*s", event->topic_len-ha_len-1, event->topic+ha_len+1 );
+      mqtt_process_ha( ctxt, ha_topic, event );
+    }
+    return;
+  }
+
   size_t offset = strlen( ctxt->topic );
   char const *subtopic = event->topic + offset + 1;
 
@@ -515,7 +656,9 @@ static void mqtt_state_machine( struct mqtt_data *ctxt ) {
     mqtt_publish_cmd( ctxt );  // Clear old CMD
     mqtt_subscribe_cmd( ctxt );
     mqtt_publish_discovery( ctxt );
+    mqtt_subscribe_ha( ctxt );
     ctxt->ota_seq = 0;
+    ctxt->uptime_due = esp_timer_get_time() + HA_SETTLE_US;
 	mqtt_set_state( ctxt,MQTT_ACTIVE );
     break;
 
@@ -523,6 +666,7 @@ static void mqtt_state_machine( struct mqtt_data *ctxt ) {
     if( ctxt->info<INFO_MAX )
       mqtt_publish_info( ctxt );
     mqtt_publish_ota( ctxt );
+    mqtt_publish_uptime( ctxt );
     break;
 
   default:
