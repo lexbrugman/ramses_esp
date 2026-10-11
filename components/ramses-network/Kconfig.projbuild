@@ -90,23 +90,4 @@ menu "Network Configuration"
         	4=Debug
         	5=Verbose
 
-
-  config OTA_URL_SERVER
-    string "Server base URL for update"
-        default "https://github.com/IndaloTech/ramses_esp/releases"
-        help
-            URL of server directory which hosts the firmware images.
-            
-  config OTA_FILENAME
-    string "Image filename"
-        default "ramses_esp.bin"
-        help
-            Filename of image
-
-  config OTA_VERSION
-  string "firmware version"
-        default "latest"
-        help
-            Firmware version
-  
 endmenu

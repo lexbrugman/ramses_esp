@@ -30,10 +30,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Determine version
+      # The OTA channel tag must match the one "publish" below creates for this
+      # branch, so a binary always tracks the repo and channel it was actually
+      # built from (see FW_OTA_REPO/FW_OTA_CHANNEL in
+      # components/ramses-network/CMakeLists.txt).
+      - name: Determine version and OTA channel
         id: ver
         run: |
           echo "version=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "channel=${GITHUB_REF_NAME//\//-}-latest" >> "$GITHUB_OUTPUT"
 
       - name: Build
         uses: espressif/esp-idf-ci-action@v1
@@ -41,6 +46,10 @@ jobs:
           esp_idf_version: v${{ env.ESP_IDF_VERSION }}
           target: ${{ matrix.target }}
           path: .
+          extra_docker_args: >-
+            -e FW_VERSION=${{ steps.ver.outputs.version }}
+            -e FW_OTA_REPO=${{ github.repository }}
+            -e FW_OTA_CHANNEL=${{ steps.ver.outputs.channel }}
 
       - name: Merge binaries into single flash image
         uses: espressif/esp-idf-ci-action@v1
@@ -50,14 +59,18 @@ jobs:
           path: .
           command: |
             cd build
-            esptool.py --chip ${{ matrix.target }} merge_bin -o ramses_esp_${{ matrix.target }}.bin @flash_args
+            esptool.py --chip ${{ matrix.target }} merge_bin -o ramses_esp_${{ matrix.target }}_full.bin @flash_args
 
       # The build steps run in a container as root, so dist/ must be created
       # here on the runner for it to be writable.
+      # ramses_esp_<target>.bin is the app-only image OTA flashes;
+      # ramses_esp_<target>_full.bin adds the bootloader and partition table
+      # and is flashed at 0x0 for a first install over USB.
       - name: Stage release assets
         run: |
           mkdir -p dist
-          cp build/ramses_esp_${{ matrix.target }}.bin dist/
+          cp build/ramses_esp.bin dist/ramses_esp_${{ matrix.target }}.bin
+          cp build/ramses_esp_${{ matrix.target }}_full.bin dist/
           echo -n "${{ steps.ver.outputs.version }}" > dist/version.txt
 
       - name: Upload build artifact
@@ -67,7 +80,7 @@ jobs:
           path: dist/
 
   publish:
-    name: Publish rolling release
+    name: Publish rolling release (OTA channel)
     if: github.event_name == 'push' && github.ref_type == 'branch'
     needs: build
     runs-on: ubuntu-latest
@@ -85,10 +98,15 @@ jobs:
           path: dist
           merge-multiple: true
 
-      # Each branch's newest firmware has a stable download URL, e.g.
+      # Devices poll a fixed per-branch channel URL for their own target's
+      # asset, e.g.
       #   .../releases/download/main-latest/ramses_esp_esp32s3.bin
-      # Only the default branch's release gets GitHub's "Latest" badge, so
-      # feature-branch pushes never steal it.
+      # so OTA always serves the newest build for the branch they track —
+      # production devices follow "main-latest", test devices can be pointed
+      # at a feature branch's "<branch>-latest" channel (see
+      # components/ramses-network/CMakeLists.txt).
+      # Only the default branch's channel gets GitHub's "Latest" badge, so
+      # feature-branch pushes never steal it from the production channel.
       - name: Publish "<branch>-latest" release
         run: |
           tag="${GITHUB_REF_NAME//\//-}-latest"
@@ -101,24 +119,25 @@ jobs:
           gh release create "$tag" dist/*.bin dist/version.txt \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
-            --title "$tag" \
-            --notes "Rolling release for branch \`$GITHUB_REF_NAME\` — CI overwrites it on every push. Built from ${GITHUB_SHA:0:7} (version ${{ needs.build.outputs.version }})." \
+            --title "$tag (OTA channel)" \
+            --notes "Rolling OTA channel for branch \`$GITHUB_REF_NAME\` — devices poll this fixed URL; CI overwrites it on every push. Built from ${GITHUB_SHA:0:7} (version ${{ needs.build.outputs.version }})." \
             --latest=$latest
 
-      # Alongside the rolling release above (which CI overwrites every push),
-      # keep one untouched release per build so past firmware versions stay
-      # browsable/downloadable. Tagged by branch+timestamp+commit so it never
-      # collides with — or gets cleaned up by — the rolling tag: the commit
-      # makes the tag unique, and the UTC commit-date stamp makes tags sort
-      # chronologically (GitHub's releases page orders by name, which is
-      # random for bare short SHAs; "latest" sorts above any digit, so the
-      # rolling release stays on top of its branch's archives). cleanup.yml
-      # parses this tag format when pruning a deleted branch's releases —
-      # keep the two in sync.
+      # Alongside the rolling channel above (which devices poll and CI
+      # overwrites every push), keep one untouched release per build so past
+      # firmware versions stay browsable/downloadable. Tagged by
+      # branch+timestamp+commit so it never collides with — or gets cleaned
+      # up by — the rolling tag: the commit makes the tag unique, and the
+      # UTC commit-date stamp makes tags sort chronologically (GitHub's
+      # releases page orders by name, which is random for bare short SHAs;
+      # "latest" sorts above any digit, so the rolling channel stays on top
+      # of its branch's archives). cleanup.yml parses this tag format when
+      # pruning a deleted branch's releases — keep the two in sync.
       # Only the default branch is archived: it's the audit trail of firmware
-      # devices may have run, while feature-branch builds are throwaway.
+      # production devices may have run, while feature-branch builds are
+      # throwaway (their rolling channel above is all a test device needs).
       # --latest=false keeps GitHub's "Latest" badge on the default branch's
-      # rolling release rather than letting it jump to whichever release was
+      # OTA channel rather than letting it jump to whichever release was
       # created last.
       - name: Archive this build's release
         if: github.ref_name == github.event.repository.default_branch
@@ -131,5 +150,5 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "$tag (build history)" \
-            --notes "Archived build for branch \`$GITHUB_REF_NAME\` — commit ${GITHUB_SHA:0:7} (version ${{ needs.build.outputs.version }})." \
+            --notes "Archived build for branch \`$GITHUB_REF_NAME\` — commit ${GITHUB_SHA:0:7} (version ${{ needs.build.outputs.version }}). Not an OTA channel; devices don't poll this." \
             --latest=false

@@ -20,4 +20,10 @@ menu "MQTT Configuration"
         help
           "Root topic for RAMSES Gateway devices"
 
+    config MQTT_HA_DISCOVERY_PREFIX
+        string "Home Assistant discovery prefix"
+        default "homeassistant"
+        help
+          "Topic prefix Home Assistant's MQTT integration watches for discovery messages"
+
 endmenu

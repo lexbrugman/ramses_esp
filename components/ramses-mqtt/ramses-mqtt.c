@@ -23,6 +23,7 @@ static const char *TAG = "MQTT";
 #include "cmd.h"
 #include "device.h"
 #include "gateway.h"
+#include "ramses_ota.h"
 #include "ramses_wifi.h"
 #include "ramses-mqtt.h"
 
@@ -70,6 +71,7 @@ struct mqtt_data {
   esp_mqtt_client_handle_t client;
 
   uint8_t info;
+  uint32_t ota_seq;	// Last OTA status published, 0 forces a publish
 };
 
 static struct mqtt_data *mqtt_ctxt( void ) {
@@ -179,6 +181,121 @@ static void mqtt_publish_info( struct mqtt_data *ctxt ) {
     sprintf( topic, "%s/info", ctxt->topic );
     publish[ctxt->info]( ctxt, topic );
     ctxt->info++;
+  }
+}
+
+/*******************************************************************************
+ * Home Assistant discovery
+ *
+ * Registers the gateway as a Home Assistant device with a firmware update
+ * entity, plus buttons to check for updates and restart. Their commands are
+ * plain console commands sent to the cmd topic.
+ */
+static void mqtt_ha_id( char *id, size_t size ) {
+  // Discovery IDs only allow [a-zA-Z0-9_-]; the device ID looks like 18:123456
+  snprintf( id, size, "ramses_esp_%s", device() );
+  for( char *c=id; *c; c++ )
+    if( *c==':' ) *c = '_';
+}
+
+static void mqtt_ha_publish( struct mqtt_data *ctxt, char const *component, char const *object, cJSON *json ) {
+  const esp_app_desc_t *app = esp_app_get_description();
+  char id[32], unique_id[64], name[48], model[48], topic[128];
+
+  mqtt_ha_id( id, sizeof(id) );
+  snprintf( unique_id, sizeof(unique_id), "%s_%s", id, object );
+  snprintf( name, sizeof(name), "RAMSES ESP %s", device() );
+  snprintf( model, sizeof(model), "%s (%s)", app->project_name, CONFIG_IDF_TARGET );
+  snprintf( topic, sizeof(topic), "%s/%s/%s/%s/config", CONFIG_MQTT_HA_DISCOVERY_PREFIX, component, id, object );
+
+  cJSON_AddStringToObject( json, "unique_id", unique_id );
+  cJSON_AddStringToObject( json, "availability_topic", ctxt->topic );
+
+  cJSON *dev = cJSON_AddObjectToObject( json, "device" );
+  cJSON *ids = cJSON_AddArrayToObject( dev, "identifiers" );
+  cJSON_AddItemToArray( ids, cJSON_CreateString( id ) );
+  cJSON_AddStringToObject( dev, "name", name );
+  cJSON_AddStringToObject( dev, "model", model );
+  cJSON_AddStringToObject( dev, "sw_version", app->version );
+
+  char *config = cJSON_PrintUnformatted( json );
+  if( config ) {
+    esp_mqtt_client_publish( ctxt->client, topic, config, 0, 1, 1 );
+    cJSON_free( config );
+  }
+  cJSON_Delete( json );
+}
+
+static void mqtt_ha_button( struct mqtt_data *ctxt, char const *object, char const *name,
+                            char const *device_class, char const *icon, char const *press ) {
+  char cmd_topic[64];
+  snprintf( cmd_topic, sizeof(cmd_topic), "%s/cmd/cmd", ctxt->topic );
+
+  cJSON *json = cJSON_CreateObject();
+  cJSON_AddStringToObject( json, "name", name );
+  if( device_class ) cJSON_AddStringToObject( json, "device_class", device_class );
+  if( icon ) cJSON_AddStringToObject( json, "icon", icon );
+  cJSON_AddStringToObject( json, "entity_category", "config" );
+  cJSON_AddStringToObject( json, "command_topic", cmd_topic );
+  cJSON_AddStringToObject( json, "payload_press", press );
+  mqtt_ha_publish( ctxt, "button", object, json );
+}
+
+static void mqtt_publish_discovery( struct mqtt_data *ctxt ) {
+  char cmd_topic[64], state_topic[64], latest_topic[64];
+  snprintf( cmd_topic, sizeof(cmd_topic), "%s/cmd/cmd", ctxt->topic );
+  snprintf( state_topic, sizeof(state_topic), "%s/ota/state", ctxt->topic );
+  snprintf( latest_topic, sizeof(latest_topic), "%s/ota/latest", ctxt->topic );
+
+  // installed_version is not a discovery field for this platform (HA drops
+  // unknown keys); it comes from the state topic's JSON, see mqtt_publish_ota
+  cJSON *json = cJSON_CreateObject();
+  cJSON_AddStringToObject( json, "name", "Firmware" );
+  cJSON_AddStringToObject( json, "device_class", "firmware" );
+  cJSON_AddStringToObject( json, "entity_category", "config" );
+  cJSON_AddStringToObject( json, "state_topic", state_topic );
+  cJSON_AddStringToObject( json, "latest_version_topic", latest_topic );
+  cJSON_AddStringToObject( json, "command_topic", cmd_topic );
+  cJSON_AddStringToObject( json, "payload_install", "ota start" );
+  cJSON_AddStringToObject( json, "title", ota_channel() );
+  cJSON_AddStringToObject( json, "release_url", ota_release_url() );
+  mqtt_ha_publish( ctxt, "update", "firmware", json );
+
+  // Re-reads the OTA channel's version now instead of waiting for the next
+  // periodic check; never installs
+  mqtt_ha_button( ctxt, "check_update", "Check for updates", NULL, "mdi:cloud-search", "ota check" );
+  mqtt_ha_button( ctxt, "restart", "Restart", "restart", NULL, "reset" );
+}
+
+static void mqtt_publish_ota( struct mqtt_data *ctxt ) {
+  struct ota_status status;
+  ota_get_status( &status );
+  if( status.seq==ctxt->ota_seq )
+    return;
+  ctxt->ota_seq = status.seq;
+
+  const esp_app_desc_t *app = esp_app_get_description();
+  char topic[64];
+
+  cJSON *json = cJSON_CreateObject();
+  cJSON_AddStringToObject( json, "installed_version", app->version );
+  cJSON_AddBoolToObject( json, "in_progress", status.in_progress );
+  if( status.percent>=0 )
+    cJSON_AddNumberToObject( json, "update_percentage", status.percent );
+  else
+    cJSON_AddNullToObject( json, "update_percentage" );
+
+  char *state = cJSON_PrintUnformatted( json );
+  if( state ) {
+    sprintf( topic, "%s/ota/state", ctxt->topic );
+    esp_mqtt_client_publish( ctxt->client, topic, state, 0, 1, 1 );
+    cJSON_free( state );
+  }
+  cJSON_Delete( json );
+
+  if( status.latest[0] ) {
+    sprintf( topic, "%s/ota/latest", ctxt->topic );
+    esp_mqtt_client_publish( ctxt->client, topic, status.latest, 0, 1, 1 );
   }
 }
 
@@ -397,12 +514,15 @@ static void mqtt_state_machine( struct mqtt_data *ctxt ) {
     mqtt_subscribe_tx( ctxt );
     mqtt_publish_cmd( ctxt );  // Clear old CMD
     mqtt_subscribe_cmd( ctxt );
+    mqtt_publish_discovery( ctxt );
+    ctxt->ota_seq = 0;
 	mqtt_set_state( ctxt,MQTT_ACTIVE );
     break;
 
   case MQTT_ACTIVE:
     if( ctxt->info<INFO_MAX )
       mqtt_publish_info( ctxt );
+    mqtt_publish_ota( ctxt );
     break;
 
   default:

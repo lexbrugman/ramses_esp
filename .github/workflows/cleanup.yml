@@ -1,7 +1,7 @@
 name: Cleanup
 
 # Firmware CI (firmware.yml) creates per-branch releases ("<branch>-latest"
-# releases and "<branch>-<timestamp>-<sha>" archives) that nothing
+# OTA channels and "<branch>-<timestamp>-<sha>" archives) that nothing
 # removes when the branch goes away. The "delete" trigger prunes a branch's releases the
 # moment it is deleted; the "release" trigger removes the git tag left
 # behind when a release is deleted by hand (GitHub keeps the tag when a
@@ -36,7 +36,7 @@ jobs:
         run: |
           gh release list --limit 1000 --json tagName -q '.[].tagName' --repo "$GITHUB_REPOSITORY" |
           while read -r tag; do
-            # Only touch CI-created tags ("<branch>-latest" releases and
+            # Only touch CI-created tags ("<branch>-latest" channels and
             # "<branch>-<timestamp>-<sha>" archives, see firmware.yml); anything
             # hand-made (e.g. "v1.0") is left alone. Branch names are sanitized
             # the same way firmware.yml builds release tags (slashes become
@@ -60,12 +60,12 @@ jobs:
         env:
           TAG: ${{ github.event.release.tag_name }}
         run: |
-          # Only touch CI-created tags ("<branch>-latest" releases and
+          # Only touch CI-created tags ("<branch>-latest" channels and
           # "<branch>-<timestamp>-<sha>" archives, see firmware.yml); anything
           # hand-made (e.g. "v1.0") is left alone.
           [[ "$TAG" =~ ^(.+)-([0-9a-f]{7,40}|latest)$ ]] || exit 0
           # A release may exist again for this tag by the time we run (e.g.
-          # the rolling "<branch>-latest" release is deleted and immediately
+          # the rolling "<branch>-latest" channel is deleted and immediately
           # recreated on every push) — leave such tags alone.
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Release exists again for $TAG; leaving tag in place"

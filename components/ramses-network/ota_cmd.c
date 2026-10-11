@@ -12,7 +12,7 @@
 #include "ramses_ota.h"
 
 /*********************************************************
- * ORL command
+ * URL command
  */
 static int ota_cmd_url( int argc, char **argv ) {
 
@@ -23,23 +23,11 @@ static int ota_cmd_url( int argc, char **argv ) {
 }
 
 /*********************************************************
- * Version command
+ * Check command
  */
-static int ota_cmd_version( int argc, char **argv ) {
+static int ota_cmd_check( int argc, char **argv ) {
 
-  if( argc>1 )
-    ota_set_version( argv[1] );
-
-  return 0;
-}
-
-/*********************************************************
- * filename command
- */
-static int ota_cmd_filename( int argc, char **argv ) {
-
-  if( argc>1 )
-	ota_set_filename( argv[1] );
+  ota_check();
 
   return 0;
 }
@@ -67,21 +55,15 @@ static int ota_cmd_force( int argc, char **argv ) {
 static esp_console_cmd_t const ota_cmds[] = {
   {
     .command = "url",
-    .help = "Set OTA <url>",
+    .help = "Set OTA channel <url>",
     .hint = NULL,
     .func = ota_cmd_url,
   },
   {
-    .command = "version",
-    .help = "Set OTA <version>",
+    .command = "check",
+    .help = "Check for a new version",
     .hint = NULL,
-    .func = ota_cmd_version,
-  },
-  {
-    .command = "filename",
-    .help = "Set OTA <filename>",
-    .hint = NULL,
-    .func = ota_cmd_filename,
+    .func = ota_cmd_check,
   },
   {
     .command = "start",
