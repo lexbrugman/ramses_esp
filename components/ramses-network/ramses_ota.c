@@ -154,6 +154,10 @@ static esp_err_t ota_fetch_version( struct ota_data *ctxt, char *version, size_t
   version[0] = '\0';
 
   esp_http_client_handle_t client = esp_http_client_init( &config );
+  if( !client ) {
+    printf("# OTA: version check failed: no HTTP client\n");
+    return ESP_ERR_NO_MEM;
+  }
   esp_err_t err = esp_http_client_perform( client );
   int status = esp_http_client_get_status_code( client );
   esp_http_client_cleanup( client );
@@ -386,21 +390,25 @@ static void ota_install( struct ota_data *ctxt ) {
  */
 static void Ota( void *param ) {
   struct ota_data *ctxt = param;
-  TickType_t wait = OTA_STARTUP_DELAY;
+  // Requests are handled in between scheduled checks and don't move them
+  TickType_t next_check = xTaskGetTickCount() + OTA_STARTUP_DELAY;
 
   ESP_LOGI( TAG, "Task Started");
 
   while( 1 ) {
     uint32_t req;
+    int32_t remaining = (int32_t)( next_check - xTaskGetTickCount() );
+    TickType_t wait = remaining>0 ? (TickType_t)remaining : 0;
     bool periodic = xTaskNotifyWait( 0, UINT32_MAX, &req, wait )==pdFALSE;
-    if( periodic )
+    if( periodic ) {
       req = OTA_REQ_CHECK;
-    wait = OTA_CHECK_INTERVAL;
+      next_check = xTaskGetTickCount() + OTA_CHECK_INTERVAL;
+    }
 
     // A scheduled check waiting for WiFi retries soon rather than a full
     // interval later; a failed fetch waits for the next interval
     if( !wifi_is_connected() ) {
-      if( periodic ) wait = OTA_RETRY_DELAY;
+      if( periodic ) next_check = xTaskGetTickCount() + OTA_RETRY_DELAY;
       else printf("# OTA: skipped, no WiFi\n");
       continue;
     }
