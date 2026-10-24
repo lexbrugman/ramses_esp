@@ -19,6 +19,9 @@ concurrency:
 jobs:
   build:
     name: Build firmware (${{ matrix.target }})
+    # A same-repo PR's head commit already gets a push run, whose checks the PR
+    # shows too, so only PRs from forks need a run of their own.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     strategy:
       matrix:
